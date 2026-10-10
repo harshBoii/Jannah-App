@@ -1,135 +1,188 @@
-# Razorpay → Cashfree migration plan (Jannah)
+# Cashfree migration plan (Jannah): FINAL
 
-Status: PLAN ONLY. No code written. Researched 2026-09-25.
-Pricing unchanged: ₹1 authorisation = 2-day trial → ₹249 daily ×7 → ₹249 weekly. Mandate ceiling ₹249.
+Status: **Implemented 2026-09-25** (backend + app). Not yet tested end-to-end — blocked on sandbox keys (see §0).
 
-## Decisions (user, 2026-09-25)
-- **Android only.** No iOS work.
-- **One-tap payment:** the installed UPI apps show as a row on the paywall. Pre-select the last-used app if it's still installed, otherwise GPay, otherwise the first app in the list. Pay goes straight into that app. No Cashfree-hosted screen.
-- **Indian numbers only:** use the profile phone number as-is. The `_UpiPhoneSheet` re-prompt is removed.
-- **No UPI app installed:** show a message and disable Pay.
-- **Razorpay is removed entirely** (backend lib, routes, entitlement helpers, env vars, `razorpay_flutter`, docs/terms mentions). No dual-provider period.
-- **Flow:** ON_DEMAND UPI AutoPay subscription. The server raises every charge. Access is granted only by the webhook.
+## 0. Implementation notes (what differs from the plan below)
+- API **and webhook version: `2025-01-01`** (not 2026-01-01): Cashfree's published webhook samples are in that version, and the parser is written against them. Set the dashboard webhook to 2025-01-01.
+- Env var names: `CASHFREE_APP_ID`, `CASHFREE_APP_SECRET`, `CASHFREE_ENV`.
+- Firestore collection is now `mandates` (doc id = Cashfree `subscription_id`); the old `razorpayMandates` is left untouched for the cleanup script.
+- Backend files: `lib/billing-plan.ts`, `lib/cashfree.ts`, `lib/mandate-entitlement.ts`, `app/api/cashfree/{subscription,webhook,status,cancel}`, `scripts/revoke-razorpay-mandates.mjs`. Razorpay lib and routes deleted.
+- Charges raised at due−26h, pulled back to 20:00 IST if that would fall at 21:00–23:59 (Cashfree's T+1 cut-off); `payment_schedule_date` = due date or the earliest allowed.
+- The Cashfree native Android SDK also declares the UPI `<queries>`; ours stays regardless.
+- Customer email sent to Cashfree: `u-{uid}@allah-police.vercel.app` (undeliverable, uid-scoped).
 
----
+Pricing is unchanged:
+- ₹1 authorisation = 2-day trial
+- then ₹249 a day for 7 days
+- then ₹249 a week
 
-## 0. Findings
-
-### Direct-to-app mandate approval: supported by the SDK
-- Installed apps: `CFUPIUtils().getUPIApps()`.
-  - On Android this is a native package-manager query (`CFUPIUtil.getInstalledUPIApps`).
-  - Returns `[{id: <package>, displayName, icon: <base64>}]`.
-- Mandate approval, from SDK 2.3.2+49 (current version 2.4.0+52):
-  `CFSubsUPIBuilder().setChannel(CFSubsUPIChannel.INTENT).setUPIID(<package>)`
-  → `CFSubsUPIPaymentBuilder().setSession(CFSubscriptionSession).setUPI(...)`
-  → `CFPaymentGatewayService().doPayment(...)`
-  On Android this becomes native `CFSubsUpiPayment` → `doSubscriptionPayment`.
-- INTENT is the only channel, and the SDK always needs one specific package. There is no generic chooser (RN SDK issue #100). We build the chooser ourselves.
-- **Not verified:** whether the SDK shows a brief loader of its own before handing off to the app. Check in sandbox.
-- SDK source checked: github.com/cashfree/flutter-cashfree-pg-sdk main @ 553a9fe (2026-05-22).
-
-### Raw API fallback (only if the SDK route fails in testing)
-- `POST /pg/subscriptions/pay` with `payment_type: AUTH`, `subscription_session_id` and `payment_method.upi.channel: "link"`.
-- The response has separate links per app, in `data.payload.upiIntentData.androidAuthAppLinks` (`GPAY`, `PAYTM`, `BHIM`, `AMAZONPAY`, `DEFAULT`).
-  - The links are `intent://mandate?…&recur=ASPRESENTED&amrule=MAX…#Intent;scheme=upi;package=…;end`.
-  - PhonePe is missing from Cashfree's sample, so it would get `DEFAULT` pointed at its package.
-- Opening these needs a small native channel (`Intent.parseUri`). That is a new dependency or native code, so it needs your approval first.
-- UPI AutoPay Collect (the user types a UPI ID) is being retired under NPCI rules, so we don't use it.
-
-### Schedule works on ON_DEMAND UPI
-- The FAQ lists UPI AutoPay frequencies as "Daily, weekly, monthly, ad-hoc".
-- A charge raised between 00:00 and 20:59 IST on day T can be scheduled for T+1. Same-day is not allowed.
-- There must be 25 hours between the pre-debit notification and the charge. The amount is fixed once the notification goes out.
-- NPCI rules: debits run only off-peak (before 10:00, 13:00–17:00, after 21:30), with 1 attempt + 3 retries.
-- The ₹1 trial: `authorization_amount: 1` with `authorization_amount_refund: false`.
-- **Fallback:** if daily charges get rejected in sandbox, use the merchant-controlled flow (controlled notification + controlled execution APIs).
-
-### Account enablement
-- **UPI AutoPay is NOT self-serve.** The docs say Cashfree activates it on request, through your account manager or the Support Form, separately for **sandbox and production**. This is a hard prerequisite.
-- **7 daily charges in a row:** nothing in the docs forbids it, and every documented rule allows it: Daily frequency, T+1 scheduling, 25-hour notice. No page states it outright, so the first sandbox run is the proof. Mention it in the activation request.
-- **Direct-to-app flow:** it's in the public SDK and no enablement is documented. The docs do say some API features (e.g. merchant-controlled) need account-manager coordination, so ask in the same request. The first sandbox run proves it.
-- **Production approval of the app package:** not documented for subscriptions. Ask in the same request.
+The mandate ceiling is ₹249.
 
 ---
 
-## 1. Backend (`allah-police-web`)
-1. Move `PLANS`, `chargeDayOffset` and `chargeAmountPaise` from `lib/razorpay.ts` into `lib/billing-plan.ts`, then **delete** `lib/razorpay.ts`, `lib/razorpay-entitlement.ts` (after porting its Firestore helpers to `lib/cashfree-entitlement.ts`) and `app/api/razorpay/**`.
-2. New `lib/cashfree.ts`, using `x-api-version: 2026-01-01` and the `x-client-id` / `x-client-secret` headers:
-   - `createSubscription()`: `POST /pg/subscriptions` with:
-     - `subscription_id = ap_{uid}_{ts}`
-     - `plan_details {plan_type: ON_DEMAND, plan_max_amount: 249}`
-     - `authorization_details {authorization_amount: 1, authorization_amount_refund: false, payment_methods: ["upi"]}`
-     - `customer_details` (phone, `{uid}@no-reply.invalid`)
-     - 10-year `subscription_expiry_time`
-     - `subscription_tags {app: "jannah"}`
-     - a short `session_id_expiry`
-     - Returns `subscription_session_id`.
-   - `raiseCharge()`: `POST /pg/subscriptions/pay` with `payment_type: CHARGE`, `payment_id = {mandateId}_c{n}` (also sent as `x-idempotency-key`), `payment_amount` in **rupees**, and `payment_schedule_date` = due date.
-   - `fetchSubscription()` and `fetchPayment()`, for reconciliation.
-   - `cancelSubscription()`: `POST /pg/subscriptions/{id}/manage {action: CANCEL}`.
-   - `verifyWebhookSignature()`: `base64(HMAC-SHA256(x-webhook-timestamp + rawBody, clientSecret))`, compared in constant time. **Always enforced.**
-   - `parseWebhook()`: maps `SUBSCRIPTION_AUTH_STATUS`, `SUBSCRIPTION_STATUS_CHANGED`, `SUBSCRIPTION_PAYMENT_SUCCESS`, `_FAILED` and `_CANCELLED` onto the existing `MandateEvent` shape.
-3. New routes: `/api/cashfree/subscription`, `/api/cashfree/cancel`, `/api/cashfree/webhook` and `/api/cashfree/status`.
-   - `/status` fetches the subscription and settles entitlement through the same code the webhook uses. It covers lost webhooks, which Cashfree can't resend.
-4. Firestore mandate docs store `subscriptionId` in place of Razorpay's `customerId`/`tokenId`. No `provider` field is needed.
-5. Scheduler:
-   - Each charge n is raised on the morning (IST) of the day before it's due, one pending at a time.
-   - A cron job reconciles charges still PENDING after 48 hours.
-6. **Duplicate-mandate guard:**
-   - Before creating a subscription, check the user's latest one. If it's ACTIVE or BANK_APPROVAL_PENDING, return `already_pending`.
-   - If a second mandate still activates, the webhook cancels the newer one.
-7. Remove the `RAZORPAY_*` env vars. Before deleting the code, check Firestore for any live `ap_` Razorpay mandates. If any exist, cancel them once through the Razorpay API, so no user is left holding a mandate nobody will ever charge. The paywall has been env-gated off, so there may be none.
-8. Update `/terms` and `/privacy` to name Cashfree instead of Razorpay.
+## 1. Decisions
+| # | Decision |
+|---|---|
+| D1 | **Cashfree only. Razorpay is removed entirely**: backend lib, routes, entitlement helpers, env vars, `razorpay_flutter`, and every mention in copy and legal pages. |
+| D2 | **ON_DEMAND UPI AutoPay subscription.** The server raises every charge (the equivalent of Razorpay's charge-at-will). |
+| D3 | **Android only.** |
+| D4 | **One-tap payment:** installed UPI apps show as a row on the paywall, with the last-used app selected (fallback GPay, then the first in the list). Pay goes straight into that app through the SDK's subscription UPI intent. No Cashfree-hosted screen. |
+| D5 | **Indian numbers only:** the profile phone number is used as-is, and the phone re-prompt sheet is removed. |
+| D6 | **No UPI app installed:** show a message and disable Pay. |
+| D7 | **Only the webhook grants access.** SDK callbacks and what the UPI app returns never do. Webhook signatures are always checked. |
+| D8 | **No new dependencies** beyond `flutter_cashfree_pg_sdk`. Small, targeted edits: no restructuring of the paywall or billing module. |
 
-## 2. Client: one-tap UPI (Flutter, Android)
-1. `pubspec.yaml`: remove `razorpay_flutter`, add `flutter_cashfree_pg_sdk: ^2.4.0+52`. No other new packages. Remove any Razorpay ProGuard or manifest entries, and update the paywall doc comments and l10n strings that mention Razorpay.
-2. **AndroidManifest `<queries>`:** without this, detecting installed apps returns an empty list on Android 11+. The SDK doesn't add it.
-   ```xml
-   <queries>
-     <intent>
-       <action android:name="android.intent.action.VIEW" />
-       <data android:scheme="upi" />
-     </intent>
-   </queries>
-   ```
-   Also add the SDK's `cashfree_subscription_flow_enable` meta-data if sandbox shows the element flow needs it.
-3. App list from `getUPIApps()`: never hardcoded.
-   - Loaded when the paywall opens, and refreshed when the app returns to the foreground.
-   - Known apps sort first: GPay `com.google.android.apps.nbu.paisa.user`, PhonePe `com.phonepe.app`, Paytm `net.one97.paytm`. The package names are used only for ordering and the default choice.
-4. Default selection: the last-used package (saved locally) if it's still installed → otherwise GPay if installed → otherwise the first app in the list.
-5. `paywall_screen.dart`: small, targeted edits.
-   - A horizontal row of app chips (icon + name) above the Start button.
-   - `_startPurchase` uses the profile phone number and the selected package.
-   - `_upiPhone()` and its sheet are removed.
-   - The last-used package is saved when the purchase starts.
-   - The existing waiting overlay and entitlement stream are kept.
-6. `billing_service.dart`: `subscribe(phone:, upiPackage:)` calls `/api/cashfree/subscription`, then builds `CFSubscriptionSession` → `CFSubsUPI(INTENT, upiPackage)`, then `doPayment`.
-   - SDK callbacks only change the UI and never grant access.
+## 2. Research findings (the basis for the decisions)
+- **Direct-to-app mandate approval is in the SDK** (added in 2.3.2+49; current version 2.4.0+52, from 2026-05).
+  - `CFUPIUtils().getUPIApps()` is a native package-manager query. It returns `[{id: package, displayName, icon: base64}]`.
+  - `CFSubsUPIBuilder().setChannel(INTENT).setUPIID(package)` → `CFSubsUPIPaymentBuilder` → `CFPaymentGatewayService().doPayment()`.
+  - INTENT is the only channel, and it always targets one specific package, so we build the chooser ourselves.
+  - Verified in the SDK source, main @ 553a9fe.
+- **Daily UPI charges are possible on ON_DEMAND:**
+  - UPI AutoPay supports Daily frequency.
+  - A charge raised between 00:00 and 20:59 IST on day T can be scheduled for T+1. Same-day is not allowed.
+  - There must be 25 hours between the pre-debit notification and the debit, and the amount is fixed once the notification goes out.
+  - NPCI rules: debits run off-peak only, with 1 attempt + 3 retries.
+  - The mandate is created as `recur=ASPRESENTED`, the same kind as today.
+- **₹1 trial:** `authorization_amount: 1` with `authorization_amount_refund: false`. A ₹0 authorisation isn't allowed on UPI anyway.
+- **ON_DEMAND limits:** no PAUSE or CHANGE_PLAN. We use neither.
+- **Webhooks:**
+  - Configured under the Subscriptions tab, version `2025-01-01`.
+  - Signed as `base64(HMAC-SHA256(x-webhook-timestamp + rawBody, clientSecret))`.
+  - **Cashfree can't resend them**, so we have to reconcile ourselves.
+- **Account:** Subscriptions are enabled (confirmed by the user). The first sandbox call confirms that UPI is an enabled subscription payment method.
+- **Fallbacks:** only if sandbox tests fail. Each one needs your approval.
+  - (a) Daily debits rejected → Cashfree's merchant-controlled notify/execute APIs.
+  - (b) The SDK intent fails → raw `POST /pg/subscriptions/pay` AUTH with `upi.channel: "link"`, which returns `upiIntentData.androidAuthAppLinks` per app. Launching those needs a little native code.
 
-## 3. Knowing whether the mandate was approved
-- **The webhook decides.** `SUBSCRIPTION_AUTH_STATUS` success, or `STATUS_CHANGED` → ACTIVE, writes `users/{uid}.entitlement`. The `AppState` stream then swaps the paywall out.
-- When the app resumes with a mandate pending, it calls `/api/cashfree/status`.
-- What the UPI app returns when it closes, and the SDK callbacks, are never trusted.
+## 3. Keys & setup needed from you
+**Backend env (`allah-police-web`, Vercel and local `.env`):**
+| Var | Value |
+|---|---|
+| `CASHFREE_CLIENT_ID` | Sandbox App ID (production App ID at launch) |
+| `CASHFREE_CLIENT_SECRET` | Sandbox Secret Key (production at launch). It also verifies webhooks, so no separate secret is needed |
+| `CASHFREE_ENV` | `sandbox` or `production`. Chooses the API base URL, **and the backend tells the app which environment to use**, so the two can never mismatch |
 
-## 4. Failure paths
+Existing Firebase Admin and QStash env vars are reused unchanged.
+
+**The Flutter app needs no Cashfree keys.** It only receives `subscription_id` + `subscription_session_id` + `environment` from the backend.
+
+**Cashfree dashboard (after the webhook route is deployed):**
+- Developers → Webhooks → **Subscriptions** tab → add `https://<backend>/api/cashfree/webhook`, version `2025-01-01`, all subscription events. Do this for sandbox and again for production.
+
+**One-off:** keep the current `RAZORPAY_*` keys until the cleanup in step B7 has run. They're deleted after that.
+
+**Question:** is this Cashfree account shared with the Mandir App or FLAMES, like the Razorpay one was? If yes, the webhook keeps dropping other apps' events (`ap_` prefix + `app: jannah` tag) as it does today. I'm keeping that filter either way, since it costs nothing.
+
+## 4. Backend (`allah-police-web`)
+B1. **`lib/billing-plan.ts`:**
+- Moves `PLANS`, `PlanKey`, `isPlanKey`, `chargeDayOffset` and `chargeAmountPaise` out of `lib/razorpay.ts` unchanged.
+- The amounts stay in paise internally, with a single `toRupees()` at the Cashfree call boundary.
+
+B2. **`lib/cashfree.ts`:** base `https://sandbox.cashfree.com/pg` or `https://api.cashfree.com/pg`, with headers `x-api-version: 2025-01-01`, `x-client-id` and `x-client-secret`. It uses a typed `CashfreeApiError` (with the same `isPermanent` logic as today) and contains:
+- `createSubscription({mandateId, phone, email, name})` → `POST /subscriptions`
+  - `subscription_id = mandateId` (`ap_{uid}_{ts36}`)
+  - `plan_details {plan_type: ON_DEMAND, plan_max_amount: 249, plan_name}`
+  - `authorization_details {authorization_amount: 1, authorization_amount_refund: false, payment_methods: ["upi"]}`
+  - `customer_details {customer_phone, customer_email: {uid}@no-reply.invalid, customer_name}`
+  - `subscription_expiry_time` +10 years
+  - `subscription_tags {app: "jannah"}`
+  - `subscription_meta.session_id_expiry` +15 min
+  - → `{subscriptionSessionId, cfSubscriptionId}`
+- `raiseCharge({mandateId, chargeIndex, dueDate})` → `POST /subscriptions/pay`
+  - `payment_type: CHARGE`, `payment_id = {mandateId}_c{n}` (the same value is sent as `x-idempotency-key`)
+  - `payment_amount` in rupees, `payment_schedule_date = dueDate` (IST)
+- `fetchSubscription(id)`, `fetchPayment(id, paymentId)`
+- `cancelSubscription(id)` → `POST /subscriptions/{id}/manage {action: CANCEL}`
+- `verifyWebhookSignature({rawBody, timestamp, signature})`: constant-time compare. Fails closed if the secret is missing.
+- `parseWebhook(body)` → the existing `MandateEvent` shape. It covers `SUBSCRIPTION_AUTH_STATUS`, `SUBSCRIPTION_STATUS_CHANGED`, `SUBSCRIPTION_PAYMENT_SUCCESS`, `SUBSCRIPTION_PAYMENT_FAILED` and `SUBSCRIPTION_PAYMENT_CANCELLED`. Everything else is acknowledged and ignored.
+
+B3. **`lib/billing-entitlement.ts`:** a port of `lib/razorpay-entitlement.ts`.
+- The same Firestore docs, event ledger (duplicate delivery is safe) and entitlement writes.
+- Mandate docs store `subscriptionId` where they held `customerId`/`tokenId`/`orderId`.
+- Status mapping:
+  - auth success or `ACTIVE` → entitled
+  - `CUSTOMER_CANCELLED` / `CANCELLED` / `EXPIRED` / `COMPLETED` → cancelled
+  - `ON_HOLD` → payment failing
+  - failed auth → discarded
+
+B4. **Routes**, under `app/api/cashfree/`:
+- `subscription`: authenticated uid → **duplicate guard** → `createSubscription` → record intent → return `{mandateId, subscriptionId, subscriptionSessionId, environment}`.
+  - Duplicate guard: if the user's latest mandate is ACTIVE or BANK_APPROVAL_PENDING, return `already_pending` and don't create another.
+- `webhook`: raw body → signature check (401 on failure) → parse → drop foreign events → apply → book the next charge through the existing QStash `publishDebitTask`. Same 200/500 rules as today.
+- `status`: authenticated uid → fetch the latest pending mandate from Cashfree → apply it through **the same function the webhook uses**. This makes up for lost webhooks.
+- `cancel`: authenticated uid → stop the schedule → `cancelSubscription`. The resulting webhook updates entitlement.
+- Debit task and hourly reconciliation: port the existing QStash debit handler and the reconciliation sweep so they call `raiseCharge`.
+  - **Timing:** raise charge n on the morning (IST) of the day before it's due, with `payment_schedule_date` = the due date. One pending charge at a time.
+  - The sweep also fetches charges still PENDING after 48 hours.
+
+B5. **If a second mandate activates anyway**, e.g. from two quick retries: the webhook keeps the older one active and cancels the newer one.
+
+B6. **Delete** `lib/razorpay.ts`, `lib/razorpay-entitlement.ts`, `app/api/razorpay/**` and the `RAZORPAY_*` env reads. Update `/terms`, `/privacy` and any web copy that names Razorpay.
+
+B7. **Cleanup (before B6):** a script queries Firestore for Jannah mandates with a Razorpay token that are not cancelled. If any exist, it revokes them through Razorpay once and records the result. It's expected to find none, since the paywall has been switched off by default.
+
+## 5. App (Flutter, Android)
+A1. `pubspec.yaml`: remove `razorpay_flutter`, add `flutter_cashfree_pg_sdk: ^2.4.0+52`.
+
+A2. **`AndroidManifest.xml`:**
+- Add `<queries><intent><action android:name="android.intent.action.VIEW"/><data android:scheme="upi"/></intent></queries>`. Without it, Android 11+ reports no UPI apps.
+- Add `cashfree_subscription_flow_enable` meta-data per the SDK docs.
+- Remove any Razorpay entries (manifest and ProGuard).
+
+A3. **`services/billing/billing_service.dart`:**
+- `upiApps()` wraps `CFUPIUtils().getUPIApps()`: known apps first (GPay `com.google.android.apps.nbu.paisa.user`, PhonePe `com.phonepe.app`, Paytm `net.one97.paytm`), then the rest. Only apps the device reports are included.
+- `subscribe(phone:, upiPackage:)` calls `/api/cashfree/subscription`, then `CFSubscriptionSession` (environment from the response) → `CFSubsUPI(INTENT, upiPackage)` → `CFSubsUPIPayment` → `doPayment`.
+- The SDK callbacks resolve only the UI future. `already_pending` maps to the waiting overlay.
+- `checkStatus()` calls `/api/cashfree/status`.
+- `cancel()` points at `/api/cashfree/cancel`.
+
+A4. **Last-used app:** one new `AppSettings` field, `lastUpiPackage`, saved when a purchase starts.
+
+A5. **`screens/paywall_screen.dart`:**
+- A horizontal row of selectable app chips (icon + name) in the footer, above the Start button.
+- Default selection: `lastUpiPackage` if still installed → otherwise GPay → otherwise the first app.
+- No apps: the row is replaced by the message, and Start is disabled.
+- The app list is refreshed on `AppLifecycleState.resumed`, which also calls `checkStatus()` while waiting.
+- `_upiPhone()` and `_UpiPhoneSheet` are removed.
+- The billing disclosure (Know more), waiting overlay and promo flow are unchanged.
+
+A6. **Text:** new l10n strings for the no-UPI-app message and the "Pay with" label. Remove Razorpay from the doc comments and strings.
+
+## 6. How access is decided
+- The webhook or the `/status` route writes `users/{uid}.entitlement` → `AppState`'s Firestore stream → the startup gate swaps the paywall out.
+- The client never grants access. `firestore.rules` already rejects client writes.
+
+## 7. Failure paths
 | Case | Handling |
 |---|---|
-| No UPI app installed | The app row is replaced by "No UPI app found. Install GPay, PhonePe or Paytm to continue." Pay is disabled until one is installed (the list refreshes on resume) |
-| App uninstalled between listing and tap | SDK returns an error → message, list refreshes |
-| User backs out in the UPI app | Resume → `/status` → still pending → overlay offers "Try again". The duplicate guard prevents a second mandate |
-| Our app killed while in the UPI app | On relaunch, the entitlement stream grants access when the webhook lands. `/status` covers a lost webhook |
-| Session expired before tap | Server creates a new subscription. The unused one is never authorised |
+| No UPI app | Message, Start disabled. The list refreshes on resume |
+| App uninstalled after listing | SDK error → message, list refreshes |
+| User backs out of the UPI app | Resume → `/status` → still pending → overlay "Try again". The duplicate guard blocks a second mandate |
+| Our app killed while in the UPI app | Relaunch → the entitlement stream picks up the webhook. `/status` covers a lost webhook |
+| Session expired before approval | Next tap creates a new subscription. The old one is never authorised |
+| Charge fails | `SUBSCRIPTION_PAYMENT_FAILED` → up to 3 retries per cycle, then entitlement is lapsed |
+| User cancels in the UPI app | `STATUS_CHANGED` → CUSTOMER_CANCELLED → schedule stops, entitlement ends at the end of the paid period |
 | Bad webhook signature | 401, nothing written |
 
-## 5. Testing
-Run on sandbox and on a real Android device:
-- ₹1 authorisation through each installed app
-- 7 daily charges, then weekly
-- a failed charge and its retries
-- cancelling from the UPI app and from our API
-- backing out, killing the app, and a forged webhook
+## 8. Build order & checkpoints
+1. **B1–B3 + `subscription` route.** Checkpoint: a sandbox call creates an ON_DEMAND UPI subscription. This also proves UPI AutoPay is enabled on the account.
+2. **Webhook + status routes.** Checkpoint: a forged signature → 401; a real sandbox event → Firestore updated once, even if delivered twice.
+3. **App A1–A6.** Checkpoint, on a real Android device: the row lists only installed apps, the default is right, and Pay goes straight into the chosen app with no Cashfree screen. The ₹1 sandbox authorisation grants access through the webhook.
+4. **Debit scheduler + reconciliation.** Checkpoint (sandbox): charge 1 = ₹1, then charges 2–8 on consecutive days, then weekly. **This is the proof that 7 daily charges in a row work.**
+5. **B7 cleanup → B6 removal.** Checkpoint: nothing mentions Razorpay anywhere in the code, and `flutter analyze` + `next build` are clean.
+6. **Production:** production keys and webhook, one real ₹1 authorisation + one daily debit, then the paywall is turned on.
 
-Then one real ₹1 run in production before switching the flag on.
+## 9. Test matrix
+- Authorisation through GPay, PhonePe and Paytm
+- Back out of the UPI app
+- Kill our app while in the UPI app
+- No UPI app installed
+- Duplicate taps
+- Failed charge and its retries
+- Cancel from the UPI app and cancel from our API
+- Forged and duplicate webhooks
+- A lost webhook, recovered through `/status`
 
 ## Sources
 - https://www.cashfree.com/docs/payments/subscription/subscription_checkout_flutter_sdk
@@ -138,7 +191,9 @@ Then one real ₹1 run in production before switching the flag on.
 - https://www.cashfree.com/docs/api-reference/payments/latest/subscription/raise-a-charge-or-create-an-auth
 - https://www.cashfree.com/docs/api-reference/payments/latest/subscription/payment/raise
 - https://www.cashfree.com/docs/api-reference/payments/latest/subscription/mandate/create
+- https://www.cashfree.com/docs/api-reference/payments/latest/subscription/plans/create
 - https://www.cashfree.com/docs/api-reference/payments/latest/subscription/mandate/manage
 - https://www.cashfree.com/docs/api-reference/payments/latest/subscription/webhooks
 - https://www.cashfree.com/docs/payments/subscription/faq
+- https://www.cashfree.com/docs/payments/webhooks
 - https://github.com/cashfree/react-native-cashfree-pg-sdk/issues/100
